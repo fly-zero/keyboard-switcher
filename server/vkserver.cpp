@@ -1,4 +1,5 @@
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -22,6 +23,15 @@ private:
 	bool m_dismiss { false };
 	std::function<void()> m_func{ };
 };
+
+struct Flag
+{
+	uint64_t running          :  1;
+	uint64_t reset_connection :  1;
+	uint64_t                  : 62;
+};
+
+static Flag s_flag;
 
 inline scope_guard::scope_guard(std::function<void()> f)
 	: m_func(std::move(f))
@@ -126,25 +136,46 @@ int open_hidg0()
 
 void handle_client(int const dev, int const sock)
 {
-	while (true)
+	::fcntl(F_SETFL, sock, ::fcntl(F_GETFL, sock, O_NONBLOCK));
+
+	fd_set rset;
+	FD_ZERO(&rset);
+	FD_SET(sock, &rset);
+	auto const maxfdp1 = sock + 1;
+
+	while (s_flag.running)
 	{
-		uint64_t descriptor;
-		auto const nread = ::read(sock, &descriptor, sizeof descriptor);
-		if (nread == sizeof descriptor)
-			::write(dev, &descriptor, sizeof descriptor);
-		else if(nread == 0)
-			break;
-		else if (nread > 0)
-			std::abort();
-		else if (ECONNRESET == errno)
-			break;
-		else throw std::system_error(
-			std::make_error_code(
-				std::errc(errno)), "failed to read");
+		auto set = rset;
+		timeval timeout{ 1, 0 };
+		auto const n = ::select(maxfdp1, &set, nullptr, nullptr, &timeout);
+		if (n > 0) while (true)
+		{
+			uint64_t descriptor;
+			auto const nread = ::read(sock, &descriptor, sizeof descriptor);
+			if (nread == sizeof descriptor)
+				::write(dev, &descriptor, sizeof descriptor);
+			else if(nread == 0)
+				return;
+			else if (nread > 0)
+				std::abort();
+			else if (EAGAIN == errno)
+				break;
+			else if (ECONNRESET == errno)
+				return;
+			else throw std::system_error(
+				std::make_error_code(
+					std::errc(errno)), "failed to read");
+		}
+		else if (n == 0)
+		{
+		}
+		else
+		{
+		}
+
+		if (s_flag.reset_connection) break;
 	}
 }
-
-static volatile bool s_running = true;
 
 int main()
 {
@@ -152,14 +183,19 @@ int main()
 	{
 		::daemon(1, 0);
 
-		std::signal(SIGTERM, [](int){ s_running = false; });
+		std::signal(SIGTERM, [](int){ s_flag.running = 0; });
+
+		std::signal(SIGRTMIN, [](int){ s_flag.reset_connection = 1; });
 
 		auto const dev = ::open_hidg0();
 
-		while (s_running)
+		s_flag.running = 1;
+
+		while (s_flag.running)
 		{
 			std::cout << "listenning..." << std::endl;
 			auto const sock = ::accept_one();
+			s_flag.reset_connection = 0;
 			::handle_client(dev, sock);
 			::close(sock);
 			std::cout << "connection closed" << std::endl;
